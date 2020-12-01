@@ -121,13 +121,15 @@ static id aspect_add(id self, SEL selector, AspectOptions options, id block, NSE
 
     __block AspectIdentifier *identifier = nil;
     aspect_performLocked(^{
+        //检测当前方法是否允许被Hook，例如 retain、release、 forwardInvocation 等方法都是禁止被Hook的
         if (aspect_isSelectorAllowedAndTrack(self, selector, options, error)) {
+            //将方法信息等封装成AspectIdentifier，保存到AspectsContainer中，以备后用
             AspectsContainer *aspectContainer = aspect_getContainerForObject(self, selector);
             identifier = [AspectIdentifier identifierWithSelector:selector object:self options:options block:block error:error];
             if (identifier) {
                 [aspectContainer addAspect:identifier withOptions:options];
-
                 // Modify the class to allow message interception.
+                //真正的交换从这里开始！！！
                 aspect_prepareClassAndHookSelector(self, selector, error);
             }
         }
@@ -269,7 +271,9 @@ static IMP aspect_getMsgForwardIMP(NSObject *self, SEL selector) {
 
 static void aspect_prepareClassAndHookSelector(NSObject *self, SEL selector, NSError **error) {
     NSCParameterAssert(selector);
+    //获取目标类aspect_hookClass
     Class klass = aspect_hookClass(self, error);
+    //
     Method targetMethod = class_getInstanceMethod(klass, selector);
     IMP targetMethodIMP = method_getImplementation(targetMethod);
     if (!aspect_isMsgForwardIMP(targetMethodIMP)) {
@@ -352,24 +356,45 @@ static Class aspect_hookClass(NSObject *self, NSError **error) {
 	Class statedClass = self.class;
 	Class baseClass = object_getClass(self);
 	NSString *className = NSStringFromClass(baseClass);
+    /*
+     分析：
+     self.class: 当self是实例对象的时候，返回的是类对象，否则返回自身 。
+     object_getClass: 直接获取isa的指针；
+     
+     当self是实例对象时，self.class和object_getClass(self)相同，都是指向其类;
+     当self为类对象时，self.class是自身类，object_getClass(self) 则是其metaClass
+    */
+    
 
-    // Already subclassed
+    // 以下进项四种情况的判断：
+    
+    //1.Already subclassed
+    //判断当前是否已经被Hook
 	if ([className hasSuffix:AspectsSubclassSuffix]) {
 		return baseClass;
-
-        // We swizzle a class object, not a single object.
-	}else if (class_isMetaClass(baseClass)) {
+	}
+    
+    //2.We swizzle a class object, not a single object.
+    //判断是元类：object_getClass(类对象)得到元类
+    else if (class_isMetaClass(baseClass)) {
         return aspect_swizzleClassInPlace((Class)self);
-        // Probably a KVO'ed class. Swizzle in place. Also swizzle meta classes in place.
-    }else if (statedClass != baseClass) {
+    }
+    
+    //3.Probably a KVO'ed class. Swizzle in place. Also swizzle meta classes in place.
+    //判断是KVO过的类，KVO过的类创建的子类形状如NSKVONotifi_Person
+    else if (statedClass != baseClass) {
         return aspect_swizzleClassInPlace(baseClass);
     }
 
-    // Default case. Create dynamic subclass.
+    //4.Default case. Create dynamic subclass.
+    //默认情况，当前self是一个实例对象，则借鉴KVO的做法，创建一个子类进行方法交换
+    //好处：如果需要还原当前的方法交换，直接remove子类就可以了，对原类没有任何影响
+    
+    //拼接_Aspects_后缀，作为子类类名
 	const char *subclassName = [className stringByAppendingString:AspectsSubclassSuffix].UTF8String;
 	Class subclass = objc_getClass(subclassName);
-
 	if (subclass == nil) {
+        //使用运行时方法，动态创建一个子类，并将原来的类作为其父类
 		subclass = objc_allocateClassPair(baseClass, subclassName, 0);
 		if (subclass == nil) {
             NSString *errrorDesc = [NSString stringWithFormat:@"objc_allocateClassPair failed to allocate class %s.", subclassName];
@@ -377,8 +402,11 @@ static Class aspect_hookClass(NSObject *self, NSError **error) {
             return nil;
         }
 
+        //改写子类的forwardInvocation方法，插入Aspects
 		aspect_swizzleForwardInvocation(subclass);
+        //改写子类的.class方法，使其返回self.class，屏蔽外界对于新子类的感知，下面的操作类似；
 		aspect_hookedGetClass(subclass, statedClass);
+        //改写子类.isa的.class方法，使其返回self.class
 		aspect_hookedGetClass(object_getClass(subclass), statedClass);
 		objc_registerClassPair(subclass);
 	}
@@ -471,6 +499,7 @@ for (AspectIdentifier *aspect in aspects) {\
 }
 
 // This is the swizzled forwardInvocation: method.
+// 交换后的__aspects_forwardInvocation:方法实现
 static void __ASPECTS_ARE_BEING_CALLED__(__unsafe_unretained NSObject *self, SEL selector, NSInvocation *invocation) {
     NSCParameterAssert(self);
     NSCParameterAssert(invocation);
